@@ -1,10 +1,11 @@
 using UnityEngine;
+using System.Collections.Generic;
 
+[RequireComponent(typeof(RealYoloVision))]
 public class TurretShooter : MonoBehaviour
 {
-    [Header("Targeting")]
-    public string targetTag = "Enemy";
-    public float detectionRange = 30f;
+    [Header("Telemetry Radar (Fallback)")]
+    public float radarDetectionRange = 25f;
     public float targetHeightOffset = 1.0f;
 
     [Header("Shooting")]
@@ -27,8 +28,6 @@ public class TurretShooter : MonoBehaviour
     [Range(0f, 10f)]
     public float verticalSpread = 0.1f;
     public bool usePerlinNoise = true;
-    private float noiseOffsetX;
-    private float noiseOffsetY;
     
     [Header("Turret Parts")]
     public Transform baseTransform;
@@ -37,33 +36,31 @@ public class TurretShooter : MonoBehaviour
     public float minHeadAngle = -10f;
     public float maxHeadAngle = 45f;
 
+    private RealYoloVision yoloVision;
     private float fireTimer;
-    private Transform currentTarget;
-    private Rigidbody targetRigidbody;
-    private Vector3 lastTargetPosition;
-    private Vector3 estimatedVelocity;
+    
+    private Transform lockedTarget;
+    private Vector3 lockedAimPoint;
+    private Vector3 lockedVelocity;
+    
+    private float noiseOffsetX;
+    private float noiseOffsetY;
+    
+    private Dictionary<Transform, Vector3> velocityHistory = new Dictionary<Transform, Vector3>();
+    private Transform radarTarget;
 
     void Start()
     {
-        if (baseTransform == null)
-            baseTransform = transform;
+        yoloVision = GetComponent<RealYoloVision>();
         
-        if (headTransform == null)
-            headTransform = transform.Find("Head");
+        if (baseTransform == null) baseTransform = transform;
+        if (headTransform == null) headTransform = transform.Find("Head");
         
         if (firePoint == null)
         {
-            Transform muzzle = transform.Find("Head/Muzzle");
-            if (muzzle == null)
-                muzzle = transform.Find("Head/Head_Muzzle");
+            Transform muzzle = transform.Find("Head/Muzzle") ?? transform.Find("Head/Head_Muzzle");
             firePoint = muzzle;
         }
-
-        if (headTransform == null)
-            Debug.LogError("[TurretShooter] Head transform not found!");
-        
-        if (firePoint == null)
-            Debug.LogError("[TurretShooter] FirePoint (Muzzle) not found!");
 
         noiseOffsetX = Random.Range(0f, 100f);
         noiseOffsetY = Random.Range(0f, 100f);
@@ -71,120 +68,167 @@ public class TurretShooter : MonoBehaviour
 
     void Update()
     {
-        FindTarget();
+        ProcessTargetAcquisition();
 
-        if (currentTarget != null)
+        if (lockedTarget != null)
         {
-            AimAtTarget();
+            AimHead();
 
             fireTimer -= Time.deltaTime;
             if (fireTimer <= 0f)
             {
-                Fire();
+                ExecuteFire();
                 fireTimer = fireCooldown;
             }
         }
         else
         {
-            ReturnHeadToNeutral();
+            ResetHeadTracking();
         }
     }
 
-    void FindTarget()
+    void ProcessTargetAcquisition()
     {
-        GameObject[] targets = GameObject.FindGameObjectsWithTag(targetTag);
-
-        float bestDistance = Mathf.Infinity;
-        Transform bestTarget = null;
-
-        foreach (GameObject target in targets)
-        {
-            if (target == null) continue;
-
-            SoldierHealth health = target.GetComponent<SoldierHealth>();
-            if (health != null && health.IsDead())
-                continue;
-
-            float dist = Vector3.Distance(baseTransform.position, target.transform.position);
-            if (dist < detectionRange && dist < bestDistance)
-            {
-                bestDistance = dist;
-                bestTarget = target.transform;
-            }
-        }
-
-        if (currentTarget != bestTarget)
-        {
-            lastTargetPosition = bestTarget != null ? bestTarget.position : Vector3.zero;
-            estimatedVelocity = Vector3.zero;
-        }
-
-        currentTarget = bestTarget;
+        List<YoloDetection> detections = yoloVision.GetDetections();
         
-        if (currentTarget != null)
+        YoloDetection bestDetection = null;
+        float bestConf = 0f;
+
+        foreach (var det in detections)
         {
-            targetRigidbody = currentTarget.GetComponent<Rigidbody>();
-            
-            if (targetRigidbody == null && Time.deltaTime > 0)
+            if (det.classId == 0 && det.trackedTarget != null && det.confidence > bestConf)
             {
-                estimatedVelocity = (currentTarget.position - lastTargetPosition) / Time.deltaTime;
-                lastTargetPosition = currentTarget.position;
+                SoldierHealth health = det.trackedTarget.GetComponent<SoldierHealth>();
+                if (health == null || !health.IsDead())
+                {
+                    bestConf = det.confidence;
+                    bestDetection = det;
+                }
             }
+        }
+
+        if (bestDetection != null)
+        {
+            lockedTarget = bestDetection.trackedTarget;
+            lockedAimPoint = lockedTarget.position + Vector3.up * targetHeightOffset;
+            UpdateVelocity(lockedTarget, lockedAimPoint);
         }
         else
         {
-            targetRigidbody = null;
+            ActivateTelemetryFallback();
         }
     }
 
-    void AimAtTarget()
+    void ActivateTelemetryFallback()
     {
-        if (currentTarget == null || firePoint == null || headTransform == null) return;
+        GameObject[] sceneTargets = GameObject.FindGameObjectsWithTag(yoloVision.targetTag);
+        float closestDist = Mathf.Infinity;
+        Transform optimalTarget = null;
 
-        Vector3 targetPosition = CalculateAimPoint();
-        RotateHead(targetPosition);
+        foreach (GameObject t in sceneTargets)
+        {
+            if (t == null) continue;
+            
+            SoldierHealth health = t.GetComponent<SoldierHealth>();
+            if (health != null && health.IsDead()) continue;
+
+            float distance = Vector3.Distance(baseTransform.position, t.transform.position);
+            if (distance < radarDetectionRange && distance < closestDist)
+            {
+                closestDist = distance;
+                optimalTarget = t.transform;
+            }
+        }
+
+        radarTarget = optimalTarget;
+
+        if (radarTarget != null)
+        {
+            lockedTarget = radarTarget;
+            lockedAimPoint = radarTarget.position + Vector3.up * targetHeightOffset;
+            UpdateVelocity(lockedTarget, lockedAimPoint);
+        }
+        else
+        {
+            lockedTarget = null;
+        }
     }
 
-    Vector3 CalculateAimPoint()
+    void UpdateVelocity(Transform target, Vector3 currentPos)
     {
-        Vector3 targetPosition = currentTarget.position + Vector3.up * targetHeightOffset;
-
-        if (useLeading)
+        if (velocityHistory.TryGetValue(target, out Vector3 prevPos))
         {
-            Vector3 targetVelocity = Vector3.zero;
+            lockedVelocity = Time.deltaTime > 0 ? (currentPos - prevPos) / Time.deltaTime : Vector3.zero;
+        }
+        else
+        {
+            Rigidbody rb = target.GetComponent<Rigidbody>();
+            lockedVelocity = rb != null ? rb.linearVelocity : Vector3.zero;
+        }
+        
+        velocityHistory[target] = currentPos;
+    }
 
-            if (targetRigidbody != null)
+    void AimHead()
+    {
+        if (lockedTarget == null || firePoint == null || headTransform == null) return;
+
+        Vector3 ballisticTarget = ComputePredictedCoordinates();
+        ApplyHeadRotation(ballisticTarget);
+    }
+
+    Vector3 ComputePredictedCoordinates()
+    {
+        if (!useLeading) return lockedAimPoint;
+
+        Vector3 predictedCoords = lockedAimPoint;
+
+        for (int i = 0; i < 5; i++)
+        {
+            float tof = 0f;
+
+            if (useBallisticCalculation)
             {
-                targetVelocity = targetRigidbody.linearVelocity;
+                Vector3 trajectory = BallisticsCalculator.CalculateTrajectory(
+                    firePoint.position,
+                    predictedCoords,
+                    bulletSpeed,
+                    Physics.gravity.y,
+                    useHighArc
+                );
+
+                if (trajectory != Vector3.zero)
+                {
+                    Vector2 flatStart = new Vector2(firePoint.position.x, firePoint.position.z);
+                    Vector2 flatEnd = new Vector2(predictedCoords.x, predictedCoords.z);
+                    float range = Vector2.Distance(flatStart, flatEnd);
+                    float velocityH = new Vector2(trajectory.x, trajectory.z).magnitude * bulletSpeed;
+
+                    tof = velocityH > 0.001f ? range / velocityH : Vector3.Distance(firePoint.position, predictedCoords) / bulletSpeed;
+                }
+                else
+                {
+                    tof = Vector3.Distance(firePoint.position, predictedCoords) / bulletSpeed;
+                }
             }
             else
             {
-                targetVelocity = estimatedVelocity;
+                tof = Vector3.Distance(firePoint.position, predictedCoords) / bulletSpeed;
             }
 
-            Vector3 toTarget = targetPosition - firePoint.position;
-            float distance = toTarget.magnitude;
-            float timeToTarget = distance / bulletSpeed;
-
-            Vector3 leadOffset = targetVelocity * timeToTarget * leadingAccuracy;
-            targetPosition += leadOffset;
-
-            if (Application.isEditor)
-            {
-                Debug.DrawLine(currentTarget.position, targetPosition, Color.yellow);
-            }
+            predictedCoords = lockedAimPoint + lockedVelocity * (tof * leadingAccuracy);
         }
 
-        return targetPosition;
+        return predictedCoords;
     }
 
-    void RotateHead(Vector3 targetPosition)
+    void ApplyHeadRotation(Vector3 targetPosition)
     {
-        Vector3 fireDirection;
+        Vector3 aimVector;
 
         if (useBallisticCalculation)
         {
-            fireDirection = BallisticsCalculator.CalculateTrajectory(
+            aimVector = BallisticsCalculator.CalculateTrajectory(
                 firePoint.position,
                 targetPosition,
                 bulletSpeed,
@@ -192,72 +236,62 @@ public class TurretShooter : MonoBehaviour
                 useHighArc
             );
 
-            if (fireDirection == Vector3.zero)
-            {
-                fireDirection = (targetPosition - firePoint.position).normalized;
-            }
+            if (aimVector == Vector3.zero)
+                aimVector = (targetPosition - firePoint.position).normalized;
         }
         else
         {
-            fireDirection = (targetPosition - firePoint.position).normalized;
+            aimVector = (targetPosition - firePoint.position).normalized;
         }
 
-        Vector3 localDirection = baseTransform.InverseTransformDirection(fireDirection);
+        Vector3 localAim = baseTransform.InverseTransformDirection(aimVector);
         
-        float targetYaw = Mathf.Atan2(localDirection.x, localDirection.z) * Mathf.Rad2Deg;
-        float distanceXZ = Mathf.Sqrt(localDirection.x * localDirection.x + localDirection.z * localDirection.z);
-        float targetPitch = -Mathf.Atan2(localDirection.y, distanceXZ) * Mathf.Rad2Deg;
+        float yaw = Mathf.Atan2(localAim.x, localAim.z) * Mathf.Rad2Deg;
+        float pitchDist = Mathf.Sqrt(localAim.x * localAim.x + localAim.z * localAim.z);
+        float pitch = -Mathf.Atan2(localAim.y, pitchDist) * Mathf.Rad2Deg;
         
-        targetYaw += GetHorizontalNoise();
-        targetPitch += GetVerticalNoise();
+        yaw += EvaluateNoiseHorizontal();
+        pitch += EvaluateNoiseVertical();
         
-        targetPitch = Mathf.Clamp(targetPitch, minHeadAngle, maxHeadAngle);
+        pitch = Mathf.Clamp(pitch, minHeadAngle, maxHeadAngle);
 
-        Quaternion targetLocalRotation = Quaternion.Euler(targetPitch, targetYaw, 0f);
+        Quaternion targetQuaternion = Quaternion.Euler(pitch, yaw, 0f);
         
         headTransform.localRotation = Quaternion.Slerp(
             headTransform.localRotation, 
-            targetLocalRotation, 
+            targetQuaternion, 
             headRotationSpeed * Time.deltaTime
         );
     }
 
-    float GetHorizontalNoise()
+    float EvaluateNoiseHorizontal()
     {
         if (horizontalSpread <= 0f) return 0f;
-
+        
         if (usePerlinNoise)
         {
             noiseOffsetX += Time.deltaTime * 0.5f;
-            float noise = Mathf.PerlinNoise(noiseOffsetX, 0f) * 2f - 1f;
-            return noise * horizontalSpread;
+            return (Mathf.PerlinNoise(noiseOffsetX, 0f) * 2f - 1f) * horizontalSpread;
         }
-        else
-        {
-            return Random.Range(-horizontalSpread, horizontalSpread);
-        }
+        return Random.Range(-horizontalSpread, horizontalSpread);
     }
 
-    float GetVerticalNoise()
+    float EvaluateNoiseVertical()
     {
         if (verticalSpread <= 0f) return 0f;
-
+        
         if (usePerlinNoise)
         {
             noiseOffsetY += Time.deltaTime * 0.5f;
-            float noise = Mathf.PerlinNoise(noiseOffsetY, 0f) * 2f - 1f;
-            return noise * verticalSpread;
+            return (Mathf.PerlinNoise(noiseOffsetY, 0f) * 2f - 1f) * verticalSpread;
         }
-        else
-        {
-            return Random.Range(-verticalSpread, verticalSpread);
-        }
+        return Random.Range(-verticalSpread, verticalSpread);
     }
 
-    void ReturnHeadToNeutral()
+    void ResetHeadTracking()
     {
         if (headTransform == null) return;
-
+        
         headTransform.localRotation = Quaternion.Slerp(
             headTransform.localRotation, 
             Quaternion.identity, 
@@ -265,107 +299,45 @@ public class TurretShooter : MonoBehaviour
         );
     }
 
-    void Fire()
+    void ExecuteFire()
     {
-        if (bulletPrefab == null || firePoint == null || currentTarget == null)
-            return;
+        if (bulletPrefab == null || firePoint == null || lockedTarget == null) return;
 
-        GameObject bullet = Instantiate(bulletPrefab, firePoint.position, firePoint.rotation);
-        Rigidbody rb = bullet.GetComponent<Rigidbody>();
+        GameObject projectile = Instantiate(bulletPrefab, firePoint.position, firePoint.rotation);
+        Rigidbody rb = projectile.GetComponent<Rigidbody>();
 
         if (rb != null)
         {
-            Vector3 targetPosition = CalculateAimPoint();
-            Vector3 fireDirection;
+            Vector3 targetCoords = ComputePredictedCoordinates();
+            Vector3 launchVector;
 
             if (useBallisticCalculation)
             {
-                fireDirection = BallisticsCalculator.CalculateTrajectory(
+                launchVector = BallisticsCalculator.CalculateTrajectory(
                     firePoint.position,
-                    targetPosition,
+                    targetCoords,
                     bulletSpeed,
                     Physics.gravity.y,
                     useHighArc
                 );
 
-                if (fireDirection == Vector3.zero)
-                {
-                    fireDirection = (targetPosition - firePoint.position).normalized;
-                }
+                if (launchVector == Vector3.zero)
+                    launchVector = (targetCoords - firePoint.position).normalized;
             }
             else
             {
-                fireDirection = (targetPosition - firePoint.position).normalized;
+                launchVector = (targetCoords - firePoint.position).normalized;
             }
 
-            fireDirection = ApplyFinalSpread(fireDirection);
-
-            rb.linearVelocity = fireDirection * bulletSpeed;
-            
-            Debug.Log($"Turret fired at {currentTarget.name}");
+            launchVector = InjectFiringSpread(launchVector);
+            rb.linearVelocity = launchVector * bulletSpeed;
         }
     }
 
-    Vector3 ApplyFinalSpread(Vector3 direction)
+    Vector3 InjectFiringSpread(Vector3 baseDirection)
     {
-        float spreadH = Random.Range(-horizontalSpread * 0.5f, horizontalSpread * 0.5f);
-        float spreadV = Random.Range(-verticalSpread * 0.5f, verticalSpread * 0.5f);
-
-        Quaternion spread = Quaternion.Euler(spreadV, spreadH, 0f);
-        return spread * direction;
-    }
-
-    void OnDrawGizmosSelected()
-    {
-        if (baseTransform == null) return;
-
-        Gizmos.color = Color.yellow;
-        Gizmos.DrawWireSphere(baseTransform.position, detectionRange);
-
-        if (currentTarget != null && firePoint != null)
-        {
-            Vector3 baseTargetPos = currentTarget.position + Vector3.up * targetHeightOffset;
-            Gizmos.color = Color.red;
-            Gizmos.DrawWireSphere(baseTargetPos, 0.2f);
-
-            Vector3 leadTargetPos = CalculateAimPoint();
-            Gizmos.color = Color.green;
-            Gizmos.DrawWireSphere(leadTargetPos, 0.3f);
-            
-            Gizmos.color = Color.yellow;
-            Gizmos.DrawLine(baseTargetPos, leadTargetPos);
-
-            Gizmos.color = Color.cyan;
-            Gizmos.DrawLine(firePoint.position, leadTargetPos);
-
-            if (useBallisticCalculation && Application.isPlaying)
-            {
-                Vector3 fireDir = BallisticsCalculator.CalculateTrajectory(
-                    firePoint.position, 
-                    leadTargetPos, 
-                    bulletSpeed, 
-                    Physics.gravity.y, 
-                    useHighArc
-                );
-
-                if (fireDir != Vector3.zero)
-                {
-                    Gizmos.color = Color.magenta;
-                    Gizmos.DrawRay(firePoint.position, fireDir * 10f);
-                }
-            }
-        }
-
-        if (headTransform != null)
-        {
-            Gizmos.color = Color.blue;
-            Gizmos.DrawRay(headTransform.position, headTransform.forward * 3f);
-        }
-
-        if (firePoint != null)
-        {
-            Gizmos.color = Color.white;
-            Gizmos.DrawRay(firePoint.position, firePoint.forward * 2f);
-        }
+        float devH = Random.Range(-horizontalSpread * 0.5f, horizontalSpread * 0.5f);
+        float devV = Random.Range(-verticalSpread * 0.5f, verticalSpread * 0.5f);
+        return Quaternion.Euler(devV, devH, 0f) * baseDirection;
     }
 }

@@ -7,7 +7,12 @@ public class Bullet : MonoBehaviour
     public float lifeTime = 5f;
     
     [Header("Physics")]
-    public bool useGravity = true; // Включить физику гравитации
+    public bool useGravity = true;
+
+    [Header("Visuals")]
+    public bool useTrail = true;
+    public float trailDuration = 1f;
+    public Color trailColor = Color.yellow;
 
     private Rigidbody rb;
 
@@ -19,25 +24,45 @@ public class Bullet : MonoBehaviour
         {
             rb.useGravity = true;
         }
+
+        if (useTrail)
+        {
+            SetupTrail();
+        }
         
         Destroy(gameObject, lifeTime);
-        Debug.Log($"[{name}] Bullet spawned with gravity: {useGravity}");
+    }
+
+    void SetupTrail()
+    {
+        TrailRenderer tr = GetComponent<TrailRenderer>();
+        if (tr == null)
+        {
+            tr = gameObject.AddComponent<TrailRenderer>();
+        }
+
+        tr.time = trailDuration;
+        
+        tr.startWidth = 0.05f;
+        tr.endWidth = 0f;
+        
+        tr.material = new Material(Shader.Find("Sprites/Default"));
+        
+        Gradient gradient = new Gradient();
+        gradient.SetKeys(
+            new GradientColorKey[] { new GradientColorKey(trailColor, 0.0f), new GradientColorKey(Color.red, 1.0f) },
+            new GradientAlphaKey[] { new GradientAlphaKey(1.0f, 0.0f), new GradientAlphaKey(0.0f, 1.0f) }
+        );
+        tr.colorGradient = gradient;
     }
 
     void OnCollisionEnter(Collision collision)
     {
-        Debug.Log($"[{name}] Hit: {collision.collider.name}");
-
         SoldierHealth health = collision.collider.GetComponentInParent<SoldierHealth>();
 
         if (health != null)
         {
-            Debug.Log($"[{name}] SoldierHealth found on {health.name}. Applying damage.");
             health.TakeDamage(damage);
-        }
-        else
-        {
-            Debug.Log($"[{name}] No SoldierHealth found in parent chain.");
         }
 
         Destroy(gameObject);
