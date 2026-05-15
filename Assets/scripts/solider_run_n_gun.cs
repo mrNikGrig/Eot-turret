@@ -3,7 +3,7 @@ using UnityEngine;
 public class SoldierAI : MonoBehaviour
 {
     [Header("Movement")]
-    public float moveSpeed = 2f;
+    public float moveSpeed = 2.5f;
     public float changeDirectionTime = 2.5f;
 
     [Header("Animator")]

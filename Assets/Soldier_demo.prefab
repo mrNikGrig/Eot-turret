@@ -272,8 +272,8 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: dc116bbdfe4854147a31e7df4cee9e9e, type: 3}
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SoldierAI
-  moveSpeed: 2
-  changeDirectionTime: 3
+  moveSpeed: 2.5
+  changeDirectionTime: 2
   speedParameterName: Speed
 --- !u!114 &2665384194823540967
 MonoBehaviour:
@@ -288,4 +288,4 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: Assembly-CSharp::SoldierHealth
   maxHealth: 1
-  destroyDelay: 2
+  destroyDelay: 0.2
