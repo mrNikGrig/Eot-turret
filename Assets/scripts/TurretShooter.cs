@@ -10,13 +10,27 @@ public class TurretShooter : MonoBehaviour
     [Header("Shooting")]
     public Transform firePoint;
     public GameObject bulletPrefab;
-    public float bulletSpeed = 25f;
     public float fireRate = 4f;
     public float muzzleForwardOffset = 0.5f;
 
-    [Header("Leading")]
-    public bool useLeading = true;
-    public float leadingAccuracy = 1f;
+    [Header("BB / Ballistics (mean parameters)")]
+    public float muzzleEnergyJ = 1.2f;
+    public float bbMassGrams = 0.25f;
+    public float bbDiameterMm = 5.95f;
+
+    [Header("Environment")]
+    public Vector3 gravity = new Vector3(0f, -9.81f, 0f);
+    public float airDensity = 1.225f;
+    public Vector3 wind = Vector3.zero;
+
+    [Header("Quadratic Drag")]
+    public float dragCd = 0.47f;
+
+    [Header("Hop-up / Magnus (mean)")]
+    public float hopUpSpinRps = 150f;
+    public float magnusLiftSlope = 1.2f;
+    public float maxLiftCoefficient = 1.0f;
+    public float spinDecayRate = 1.5f;
 
     [Header("Turret Parts")]
     public Transform baseTransform;
@@ -32,14 +46,29 @@ public class TurretShooter : MonoBehaviour
     public float yawDamping = 8f;
     public float pitchDamping = 8f;
 
+    [Header("Intercept solver")]
+    public float interceptSolveHz = 10f;    // как часто пересчитывать решение
+    public float simDt = 0.01f;             // шаг интегрирования в решателе
+    public float maxSimTime = 3.0f;         // максимум времени полёта в расчёте
+    public float hitRadius = 0.25f;         // радиус "попадания" в расчёте (м)
+    public float coarseAngleStepDeg = 4.0f; // начальный шаг поиска
+    public int refineIterations = 4;        // уточнения
+    public float fireConeDeg = 1.5f;        // стрелять только если в этом конусе
+
     private RealYoloVision yoloVision;
     private float fireTimer;
 
     private Transform lockedTarget;
     private Vector3 lockedAimPoint;
-    private Vector3 lockedVelocity;
 
-    private Dictionary<Transform, Vector3> velocityHistory = new Dictionary<Transform, Vector3>();
+    // kinematics state per target
+    private readonly Dictionary<Transform, Vector3> lastPos = new();
+    private readonly Dictionary<Transform, Vector3> lastVel = new();
+    private readonly Dictionary<Transform, float> lastTime = new();
+
+    private Vector3 lockedVelocity;
+    private Vector3 lockedAcceleration;
+
     private Transform radarTarget;
 
     private float currentYaw;
@@ -48,6 +77,12 @@ public class TurretShooter : MonoBehaviour
     private float pitchVelocity;
 
     private Collider[] turretColliders;
+
+    // intercept result
+    private float interceptTimer;
+    private Vector3 desiredAimDirWorld = Vector3.forward;
+    private float desiredTOF;
+    private float desiredScore;
 
     void Start()
     {
@@ -75,12 +110,21 @@ public class TurretShooter : MonoBehaviour
 
         if (lockedTarget != null)
         {
-            AimHead();
+            interceptTimer -= Time.deltaTime;
+            if (interceptTimer <= 0f)
+            {
+                SolveIntercept();
+                interceptTimer = 1f / Mathf.Max(1f, interceptSolveHz);
+            }
+
+            AimHead(desiredAimDirWorld);
 
             fireTimer -= Time.deltaTime;
             if (fireTimer <= 0f)
             {
-                ExecuteFire();
+                if (IsAimedEnough())
+                    ExecuteFire();
+
                 fireTimer = 1f / fireRate;
             }
         }
@@ -89,6 +133,18 @@ public class TurretShooter : MonoBehaviour
             ResetHeadTracking();
         }
     }
+
+    bool IsAimedEnough()
+    {
+        if (firePoint == null) return false;
+        float angle = Vector3.Angle(firePoint.forward, desiredAimDirWorld);
+        return angle <= fireConeDeg;
+    }
+
+    float MassKg => Mathf.Max(1e-6f, bbMassGrams / 1000f);
+    float RadiusM => Mathf.Max(1e-6f, (bbDiameterMm / 1000f) * 0.5f);
+    float Area => PointMassBallistics.CrossSectionArea(RadiusM);
+    float MuzzleSpeed => PointMassBallistics.MuzzleSpeedFromEnergy(muzzleEnergyJ, MassKg);
 
     void ProcessTargetAcquisition()
     {
@@ -114,7 +170,7 @@ public class TurretShooter : MonoBehaviour
         {
             lockedTarget = bestDetection.trackedTarget;
             lockedAimPoint = GetTargetCenter(lockedTarget);
-            UpdateVelocity(lockedTarget, lockedAimPoint);
+            UpdateTargetKinematics(lockedTarget, lockedAimPoint);
         }
         else
         {
@@ -149,7 +205,7 @@ public class TurretShooter : MonoBehaviour
         {
             lockedTarget = radarTarget;
             lockedAimPoint = GetTargetCenter(radarTarget);
-            UpdateVelocity(lockedTarget, lockedAimPoint);
+            UpdateTargetKinematics(lockedTarget, lockedAimPoint);
         }
         else
         {
@@ -160,54 +216,51 @@ public class TurretShooter : MonoBehaviour
     Vector3 GetTargetCenter(Transform target)
     {
         Renderer rend = target.GetComponentInChildren<Renderer>();
-        if (rend != null)
-            return rend.bounds.center;
+        if (rend != null) return rend.bounds.center;
 
         Collider col = target.GetComponentInChildren<Collider>();
-        if (col != null)
-            return col.bounds.center;
+        if (col != null) return col.bounds.center;
 
         return target.position;
     }
 
-    void UpdateVelocity(Transform target, Vector3 currentPos)
+    void UpdateTargetKinematics(Transform target, Vector3 currentPos)
     {
-        if (velocityHistory.TryGetValue(target, out Vector3 prevPos))
-            lockedVelocity = (currentPos - prevPos) / Mathf.Max(Time.deltaTime, 0.0001f);
+        float t = Time.time;
+
+        if (lastTime.TryGetValue(target, out float tPrev))
+        {
+            float dt = Mathf.Max(1e-4f, t - tPrev);
+
+            Vector3 v = (currentPos - lastPos[target]) / dt;
+
+            if (lastVel.TryGetValue(target, out Vector3 vPrev))
+                lockedAcceleration = (v - vPrev) / dt;
+            else
+                lockedAcceleration = Vector3.zero;
+
+            lockedVelocity = v;
+            lastVel[target] = v;
+        }
         else
         {
-            Rigidbody rb = target.GetComponent<Rigidbody>();
-            lockedVelocity = rb != null ? rb.linearVelocity : Vector3.zero;
+            lockedVelocity = Vector3.zero;
+            lockedAcceleration = Vector3.zero;
+            lastVel[target] = Vector3.zero;
         }
 
-        velocityHistory[target] = currentPos;
+        lastPos[target] = currentPos;
+        lastTime[target] = t;
     }
 
-    void AimHead()
+    void AimHead(Vector3 aimDirWorld)
     {
-        Vector3 predicted = ComputePredictedCoordinates();
-        ApplyHeadRotation(predicted);
+        ApplyHeadRotationFromDirection(aimDirWorld);
     }
 
-    Vector3 ComputePredictedCoordinates()
+    void ApplyHeadRotationFromDirection(Vector3 aimDirWorld)
     {
-        if (!useLeading) return lockedAimPoint;
-
-        Vector3 predicted = lockedAimPoint;
-
-        for (int i = 0; i < 5; i++)
-        {
-            float tof = Vector3.Distance(firePoint.position, predicted) / bulletSpeed;
-            predicted = lockedAimPoint + lockedVelocity * (tof * leadingAccuracy);
-        }
-
-        return predicted;
-    }
-
-    void ApplyHeadRotation(Vector3 targetPosition)
-    {
-        Vector3 aimVector = (targetPosition - firePoint.position).normalized;
-        Vector3 localAim = baseTransform.InverseTransformDirection(aimVector);
+        Vector3 localAim = baseTransform.InverseTransformDirection(aimDirWorld.normalized);
 
         float targetYaw = Mathf.Atan2(localAim.x, localAim.z) * Mathf.Rad2Deg;
         float pitchDist = Mathf.Sqrt(localAim.x * localAim.x + localAim.z * localAim.z);
@@ -244,6 +297,125 @@ public class TurretShooter : MonoBehaviour
         headTransform.localRotation = Quaternion.Euler(currentPitch, currentYaw, 0f);
     }
 
+
+    void SolveIntercept()
+    {
+        if (firePoint == null)
+        {
+            desiredAimDirWorld = (lockedAimPoint - transform.position).normalized;
+            return;
+        }
+
+        Vector3 firePos = firePoint.position;
+
+        Vector3 dir0 = (lockedAimPoint - firePos).normalized;
+        DirToYawPitch(dir0, out float yaw0, out float pitch0);
+        pitch0 = Mathf.Clamp(pitch0, minHeadAngle, maxHeadAngle);
+
+        float bestYaw = yaw0;
+        float bestPitch = pitch0;
+        desiredScore = float.PositiveInfinity;
+        desiredTOF = 0f;
+
+        float step = coarseAngleStepDeg;
+
+        for (int iter = 0; iter < refineIterations; iter++)
+        {
+            for (int iy = -1; iy <= 1; iy++)
+            for (int ip = -1; ip <= 1; ip++)
+            {
+                float yaw = bestYaw + iy * step;
+                float pitch = Mathf.Clamp(bestPitch + ip * step, minHeadAngle, maxHeadAngle);
+
+                Vector3 dir = YawPitchToWorldDir(yaw, pitch);
+
+                float rotateDelay = EstimateRotateDelaySeconds(yaw, pitch);
+                float score = SimulateMissDistance(dir, rotateDelay, out float tof);
+
+                if (score < desiredScore)
+                {
+                    desiredScore = score;
+                    desiredTOF = tof;
+                    bestYaw = yaw;
+                    bestPitch = pitch;
+                }
+            }
+
+            step *= 0.5f;
+        }
+
+        desiredAimDirWorld = YawPitchToWorldDir(bestYaw, bestPitch).normalized;
+    }
+
+    float EstimateRotateDelaySeconds(float targetYaw, float targetPitch)
+    {
+        float dy = Mathf.Abs(Mathf.DeltaAngle(currentYaw, targetYaw));
+        float dp = Mathf.Abs(Mathf.DeltaAngle(currentPitch, targetPitch));
+
+        float tYaw = dy / Mathf.Max(1f, maxYawSpeed);
+        float tPitch = dp / Mathf.Max(1f, maxPitchSpeed);
+
+        return Mathf.Max(tYaw, tPitch);
+    }
+
+    float SimulateMissDistance(Vector3 muzzleDirWorld, float startTimeOffset, out float bestTOF)
+    {
+        Vector3 pos = firePoint.position;
+        Vector3 vel = muzzleDirWorld.normalized * MuzzleSpeed;
+
+        Vector3 omega = PointMassBallistics.BackspinAxisForVelocity(muzzleDirWorld) * (hopUpSpinRps * 2f * Mathf.PI);
+
+        float bestDist = float.PositiveInfinity;
+        bestTOF = 0f;
+
+        for (float t = 0f; t <= maxSimTime; t += simDt)
+        {
+            omega *= Mathf.Exp(-spinDecayRate * simDt);
+
+            Vector3 vRel = vel - wind;
+            Vector3 Fg = MassKg * gravity;
+            Vector3 Fd = PointMassBallistics.DragForceQuadratic(vRel, airDensity, dragCd, Area);
+            Vector3 Fm = PointMassBallistics.MagnusForce(
+                vRel, omega,
+                airDensity, Area, RadiusM,
+                magnusLiftSlope, maxLiftCoefficient
+            );
+
+            Vector3 acc = (Fg + Fd + Fm) / MassKg;
+            vel += acc * simDt;
+            pos += vel * simDt;
+
+            float tt = t + startTimeOffset;
+            Vector3 targetPos = lockedAimPoint + lockedVelocity * tt + 0.5f * lockedAcceleration * tt * tt;
+
+            float d = Vector3.Distance(pos, targetPos);
+            if (d < bestDist)
+            {
+                bestDist = d;
+                bestTOF = t;
+                if (bestDist <= hitRadius) return bestDist;
+            }
+        }
+
+        return bestDist;
+    }
+
+    void DirToYawPitch(Vector3 dirWorld, out float yawDeg, out float pitchDeg)
+    {
+        Vector3 localAim = baseTransform.InverseTransformDirection(dirWorld.normalized);
+
+        yawDeg = Mathf.Atan2(localAim.x, localAim.z) * Mathf.Rad2Deg;
+        float pitchDist = Mathf.Sqrt(localAim.x * localAim.x + localAim.z * localAim.z);
+        pitchDeg = -Mathf.Atan2(localAim.y, pitchDist) * Mathf.Rad2Deg;
+    }
+
+    Vector3 YawPitchToWorldDir(float yawDeg, float pitchDeg)
+    {
+        Vector3 localDir = Quaternion.Euler(pitchDeg, yawDeg, 0f) * Vector3.forward;
+        return baseTransform.TransformDirection(localDir).normalized;
+    }
+
+
     void ExecuteFire()
     {
         if (bulletPrefab == null || firePoint == null || lockedTarget == null) return;
@@ -252,7 +424,6 @@ public class TurretShooter : MonoBehaviour
         Quaternion spawnRot = firePoint.rotation;
 
         GameObject projectile = Instantiate(bulletPrefab, spawnPos, spawnRot);
-        Rigidbody rb = projectile.GetComponent<Rigidbody>();
 
         Collider projCol = projectile.GetComponent<Collider>();
         if (projCol != null)
@@ -261,10 +432,37 @@ public class TurretShooter : MonoBehaviour
                 Physics.IgnoreCollision(projCol, col);
         }
 
-        if (rb != null)
+        Bullet b = projectile.GetComponent<Bullet>();
+        if (b != null)
         {
-            rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
-            rb.linearVelocity = firePoint.forward * bulletSpeed;
+            b.bbMassGrams = bbMassGrams;
+            b.bbDiameterMm = bbDiameterMm;
+            b.muzzleEnergyJ = muzzleEnergyJ;
+
+            b.gravity = gravity;
+            b.airDensity = airDensity;
+            b.wind = wind;
+
+            b.dragCd = dragCd;
+
+            b.hopUpSpinRps = hopUpSpinRps;
+            b.magnusLiftSlope = magnusLiftSlope;
+            b.maxLiftCoefficient = maxLiftCoefficient;
+            b.spinDecayRate = spinDecayRate;
+            b.InitFromTurret(firePoint.forward);
+        }
+        else
+        {
+            Rigidbody rb = projectile.GetComponent<Rigidbody>();
+            if (rb != null)
+            {
+                rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic; // <!--citation:3-->
+#if UNITY_6000_0_OR_NEWER
+                rb.linearVelocity = firePoint.forward * MuzzleSpeed;
+#else
+                rb.velocity = firePoint.forward * MuzzleSpeed;
+#endif
+            }
         }
     }
 
