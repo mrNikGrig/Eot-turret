@@ -128,7 +128,25 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::Bullet
   damage: 10
   lifeTime: 5
-  useGravity: 1
+  bbMassGrams: 0.25
+  bbDiameterMm: 5.95
+  muzzleEnergyJ: 1.2
+  gravity: {x: 0, y: -9.81, z: 0}
+  airDensity: 1.225
+  wind: {x: 0, y: 0, z: 0}
+  dragCd: 0.47
+  hopUpSpinRps: 150
+  magnusLiftSlope: 1.2
+  maxLiftCoefficient: 1
+  spinDecayRate: 1.5
+  spinWobbleRadPerSec2: 5
+  angularStdDeg: 0.25
+  speedStdFraction: 0.03
+  spinStdFraction: 0.1
+  spinAxisStdDeg: 2
+  useTrail: 1
+  trailDuration: 1
+  trailColor: {r: 1, g: 0.92156863, b: 0.015686275, a: 1}
 --- !u!54 &-5571004795378568862
 Rigidbody:
   m_ObjectHideFlags: 0
@@ -139,7 +157,7 @@ Rigidbody:
   serializedVersion: 5
   m_Mass: 0.1
   m_LinearDamping: 0
-  m_AngularDamping: 0.05
+  m_AngularDamping: 0
   m_CenterOfMass: {x: 0, y: 0, z: 0}
   m_InertiaTensor: {x: 1, y: 1, z: 1}
   m_InertiaRotation: {x: 0, y: 0, z: 0, w: 1}
@@ -151,7 +169,7 @@ Rigidbody:
     m_Bits: 0
   m_ImplicitCom: 1
   m_ImplicitTensor: 1
-  m_UseGravity: 1
+  m_UseGravity: 0
   m_IsKinematic: 0
   m_Interpolate: 0
   m_Constraints: 0
