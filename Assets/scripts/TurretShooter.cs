@@ -359,46 +359,59 @@ public class TurretShooter : MonoBehaviour
     }
 
     float SimulateMissDistance(Vector3 muzzleDirWorld, float startTimeOffset, out float bestTOF)
+{
+    BallisticModel.Params p = new BallisticModel.Params
     {
-        Vector3 pos = firePoint.position;
-        Vector3 vel = muzzleDirWorld.normalized * MuzzleSpeed;
+        massKg = MassKg,
+        radiusM = RadiusM,
+        area = BallisticModel.CrossSectionArea(RadiusM),
 
-        Vector3 omega = PointMassBallistics.BackspinAxisForVelocity(muzzleDirWorld) * (hopUpSpinRps * 2f * Mathf.PI);
+        gravity = gravity,
+        airDensity = airDensity,
+        wind = wind,
 
-        float bestDist = float.PositiveInfinity;
-        bestTOF = 0f;
+        dragCd = dragCd,
 
-        for (float t = 0f; t <= maxSimTime; t += simDt)
+        magnusLiftSlope = magnusLiftSlope,
+        maxLiftCoefficient = maxLiftCoefficient,
+
+        spinDecayRate = spinDecayRate
+    };
+
+    BallisticModel.State s = new BallisticModel.State
+    {
+        pos = firePoint.position,
+        vel = muzzleDirWorld.normalized * MuzzleSpeed,
+        omega = BallisticModel.BackspinAxisForVelocity(muzzleDirWorld) * (hopUpSpinRps * 2f * Mathf.PI)
+    };
+
+    float bestDist = float.PositiveInfinity;
+    bestTOF = 0f;
+
+    float dt = simDt;
+
+    for (float t = 0f; t <= maxSimTime; t += dt)
+    {
+        BallisticModel.Step(ref s, p, dt, Vector3.zero); // в решателе без wobble
+
+        float shotDelay = Mathf.Max(0f, fireTimer);      // важно: цель едет до реального выстрела
+        float tt = t + startTimeOffset + shotDelay;
+
+        Vector3 targetPos = lockedAimPoint
+                            + lockedVelocity * tt
+                            + 0.5f * lockedAcceleration * tt * tt;
+
+        float d = Vector3.Distance(s.pos, targetPos);
+        if (d < bestDist)
         {
-            omega *= Mathf.Exp(-spinDecayRate * simDt);
-
-            Vector3 vRel = vel - wind;
-            Vector3 Fg = MassKg * gravity;
-            Vector3 Fd = PointMassBallistics.DragForceQuadratic(vRel, airDensity, dragCd, Area);
-            Vector3 Fm = PointMassBallistics.MagnusForce(
-                vRel, omega,
-                airDensity, Area, RadiusM,
-                magnusLiftSlope, maxLiftCoefficient
-            );
-
-            Vector3 acc = (Fg + Fd + Fm) / MassKg;
-            vel += acc * simDt;
-            pos += vel * simDt;
-
-            float tt = t + startTimeOffset;
-            Vector3 targetPos = lockedAimPoint + lockedVelocity * tt + 0.5f * lockedAcceleration * tt * tt;
-
-            float d = Vector3.Distance(pos, targetPos);
-            if (d < bestDist)
-            {
-                bestDist = d;
-                bestTOF = t;
-                if (bestDist <= hitRadius) return bestDist;
-            }
+            bestDist = d;
+            bestTOF = t;
+            if (bestDist <= hitRadius) return bestDist;
         }
-
-        return bestDist;
     }
+
+    return bestDist;
+}
 
     void DirToYawPitch(Vector3 dirWorld, out float yawDeg, out float pitchDeg)
     {
@@ -435,6 +448,8 @@ public class TurretShooter : MonoBehaviour
         Bullet b = projectile.GetComponent<Bullet>();
         if (b != null)
         {
+            b.SetIgnoreColliders(turretColliders);
+
             b.bbMassGrams = bbMassGrams;
             b.bbDiameterMm = bbDiameterMm;
             b.muzzleEnergyJ = muzzleEnergyJ;
@@ -444,11 +459,11 @@ public class TurretShooter : MonoBehaviour
             b.wind = wind;
 
             b.dragCd = dragCd;
-
             b.hopUpSpinRps = hopUpSpinRps;
             b.magnusLiftSlope = magnusLiftSlope;
             b.maxLiftCoefficient = maxLiftCoefficient;
             b.spinDecayRate = spinDecayRate;
+
             b.InitFromTurret(firePoint.forward);
         }
         else
